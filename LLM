@@ -1,0 +1,232 @@
+import torch
+import torch.nn as nn 
+from torch.nn import functional as F
+import urllib.request
+import os
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+block_size = 32        
+embed_dim_size = 256
+n_head = 4             
+nn_layer = 4           
+drop_out = 0.2
+batch_size = 32        
+max_iters = 1000       
+eval_interval = 200
+model_save_path = "lily_casual_chat.pth"
+local_dataset_path = "casual_dialogue.txt"
+
+if not os.path.exists(local_dataset_path):
+    print("Downloading casual conversational dataset...")
+    url = "https://githubusercontent.com"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            raw_data = response.read().decode('utf-8')
+        cleaned_conversations = []
+        for line in raw_data.split('\n'):
+            if line.strip():
+                turns = line.split('__eou__')
+                formatted_dialogue = ""
+                for i, turn in enumerate(turns):
+                    turn_str = turn.strip()
+                    if turn_str:
+                        if i % 2 == 0:
+                            formatted_dialogue += f"User: {turn_str}\n"
+                        else:
+                            formatted_dialogue += f"Lily: {turn_str}\n"
+                cleaned_conversations.append(formatted_dialogue)
+        with open(local_dataset_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(cleaned_conversations))
+    except Exception as e:
+        print(f"Network offline or failed ({e}). Generating robust local fallback data instead...")
+        fallback_samples = [
+            "User: hello there!\nLily: hey! how are you doing?\n",
+            "User: what are you up to?\nLily: just chilling, honestly. what about you?\n",
+            "User: do you want to play a game?\nLily: sure! what kind of game do you want to play?\n",
+            "User: I had a long day at work today.\nLily: oh no, i am sorry to hear that. I hope it gets better!\n"
+        ]
+        fallback_text = "".join(fallback_samples) * 300
+        with open(local_dataset_path, "w", encoding="utf-8") as f:
+            f.write(fallback_text)
+
+print(f"Parsing local file dataset from: {local_dataset_path}")
+with open(local_dataset_path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+
+stoi = { ch:i for i,ch in enumerate(chars) }
+itos = { i:ch for i,ch in enumerate(chars) }
+encode = lambda s: [stoi[c] for c in s if c in stoi] 
+decode = lambda l: ''.join([itos[i] for i in l])
+
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9 * len(data)) 
+train_data = data[:n]
+val_data = data[n:]
+
+def get_batch(split):
+    dataset = train_data if split == 'train' else val_data
+    ix = torch.randint(len(dataset) - block_size, (batch_size,))
+    x = torch.stack([dataset[i : i + block_size] for i in ix])
+    y = torch.stack([dataset[i + 1 : i + block_size + 1] for i in ix])
+    return x.to(device), y.to(device)
+
+@torch.no_grad()
+def estimate_loss(model):
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(20)
+        for k in range(20):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(embed_dim_size, head_size, bias=False)
+        self.query = nn.Linear(embed_dim_size, head_size, bias=False)
+        self.value = nn.Linear(embed_dim_size, head_size, bias=False)
+        self.dropout = nn.Dropout(drop_out)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):  
+        B, T, C = x.shape
+        k = self.key(x)   
+        q = self.query(x) 
+        v = self.value(x) 
+        wei = q @ k.transpose(-2, -1) * (C ** -0.5) 
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        return wei @ v 
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, embed_dim_size)
+        self.dropout = nn.Dropout(drop_out)
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        return self.dropout(self.proj(out))
+
+class FeedForward(nn.Module):
+    def __init__(self, embed_dim_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim_size, 4 * embed_dim_size),
+            nn.ReLU(),
+            nn.Linear(4 * embed_dim_size, embed_dim_size),
+            nn.Dropout(drop_out),
+        )
+    def forward(self, x): return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, embed_dim_size, num_heads):
+        super().__init__()
+        head_size = embed_dim_size // num_heads
+        self.sa = MultiHeadAttention(num_heads, head_size)
+        self.ffwd = FeedForward(embed_dim_size)
+        self.ln1 = nn.LayerNorm(embed_dim_size)
+        self.ln2 = nn.LayerNorm(embed_dim_size)
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+class LilyLLM(nn.Module):  
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, embed_dim_size)
+        self.position_embedding_table = nn.Embedding(block_size, embed_dim_size)
+        self.blocks = nn.Sequential(*[Block(embed_dim_size, n_head) for _ in range(nn_layer)])
+        self.ln_f = nn.LayerNorm(embed_dim_size)
+        self.lm_head = nn.Linear(embed_dim_size, vocab_size)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx) 
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
+        x = tok_emb + pos_emb 
+        x = self.blocks(x) 
+        x = self.ln_f(x) 
+        logits = self.lm_head(x) 
+        
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] 
+            probs = F.softmax(logits, dim=-1) 
+            idx_next = torch.multinomial(probs, num_samples=1) 
+            idx = torch.cat((idx, idx_next), dim=1) 
+        return idx
+
+if __name__ == '__main__':
+    model = LilyLLM().to(device)
+    
+    if os.path.exists(model_save_path):
+        print(f"Found existing model checkpoint '{model_save_path}'. Loading weights...")
+        model.load_state_dict(torch.load(model_save_path, map_location=device))
+    else:
+        print(f"No checkpoint found. Beginning custom training sequence on {device}...")
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        
+        for step in range(max_iters):
+            if step % eval_interval == 0 or step == max_iters - 1:
+                losses = estimate_loss(model)
+                print(f"Step {step:4d}: Train Loss = {losses['train']:.4f} | Val Loss = {losses['val']:.4f}")
+                
+            xb, yb = get_batch('train')
+            logits, loss = model(xb, yb)
+            
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            
+        print(f"Saving trained model weights to '{model_save_path}'...")
+        torch.save(model.state_dict(), model_save_path)logits = 
+        print("Model weights successfully secured.")
+
+    print("\nTransitioning to live conversation application.")
+    print("Type 'exit' to terminate.\n")
+
+    chat_history = ""
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == 'exit':
+            break
+        if not user_input.strip():
+            continue
+            
+        chat_history += f"User: {user_input}\nLily: "
+        
+        context_tokens = encode(chat_history)
+        context = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        
+        generated_idx = model.generate(context, max_new_tokens=60)
+        
+        new_tokens = generated_idx[0][len(context_tokens):].tolist()
+        reply = decode(new_tokens)
+        
+        reply = reply.split('\n')[0].strip()
+        
+        print(f"Lily: {reply}")
+        chat_history += f"{reply}\n"
+
