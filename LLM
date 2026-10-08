@@ -1,4 +1,4 @@
-#COUSINLLM
+# COUSIN HEADER UPDATED
 import torch
 import torch.nn as nn 
 from torch.nn import functional as F
@@ -239,3 +239,4 @@ if __name__ == '__main__':
         
         print(f"Assistant: {reply}")
         chat_history += f"{reply}\n"
+        
